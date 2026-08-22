@@ -1,0 +1,116 @@
+# Claude Code CLI を定期的に叩いて、ごく少量のトークンを消費させるためのワークフロー。
+# 目的は「アカウント / セッションをアクティブに保つこと」なので、
+# リポジトリのコードは一切コンテキストに載せず、空ディレクトリで実行する。
+name: Claude Code Ping
+
+on:
+  # 5時間ごとに自動実行（cron は UTC 基準。GitHub 側の混雑によっては数分〜数十分遅延することがある）
+  schedule:
+    - cron: '0 */5 * * *'
+  # 手動実行（Actions タブの "Run workflow" ボタン）も可能にする
+  workflow_dispatch:
+
+# リポジトリの中身を読む必要すらないので、権限は最小限に絞る
+permissions:
+  contents: read
+
+# 前の実行が残っている場合に多重実行しないようにする（無駄なトークン消費を防ぐ）
+concurrency:
+  group: claude-ping
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    # 何らかの理由でハングした場合に課金・実行時間を無駄にしないための上限
+    timeout-minutes: 10
+
+    steps:
+      # 注意: actions/checkout は意図的に実行していない。
+      # リポジトリのファイルをワークスペースに置かないことで、
+      # Claude Code が余計なファイルをコンテキストとして読み込むのを根本的に防ぐ。
+
+      # Node.js v20 をセットアップする（Claude Code CLI は Node 18+ が必要）
+      - name: Node.js のセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Claude Code CLI をグローバルインストールする
+      - name: Claude Code CLI のインストール
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          # インストールが成功したかをバージョン表示で確認する
+          claude --version
+
+      # 認証情報のセットアップ。
+      # GitHub Secrets の CLAUDE_SESSION_TOKEN を、Claude Code が認識できる環境変数に変換する。
+      #   - sk-ant-api... で始まる場合  -> API キーとみなし ANTHROPIC_API_KEY
+      #   - それ以外（sk-ant-oat... 等）-> OAuth トークンとみなし CLAUDE_CODE_OAUTH_TOKEN
+      # 後続ステップで使えるよう $GITHUB_ENV に書き出す（値はログにマスクされる）。
+      - name: 認証情報のセットアップ
+        env:
+          CLAUDE_SESSION_TOKEN: ${{ secrets.CLAUDE_SESSION_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Secret が未設定ならここで分かりやすく失敗させる
+          if [ -z "${CLAUDE_SESSION_TOKEN}" ]; then
+            echo "::error::シークレット CLAUDE_SESSION_TOKEN が設定されていません。" \
+                 "リポジトリの Settings > Secrets and variables > Actions から登録してください。"
+            exit 1
+          fi
+
+          # 万が一ログに出ても値が漏れないようマスク登録しておく
+          echo "::add-mask::${CLAUDE_SESSION_TOKEN}"
+
+          case "${CLAUDE_SESSION_TOKEN}" in
+            sk-ant-api*)
+              echo "認証方式: ANTHROPIC_API_KEY (API キー)"
+              echo "ANTHROPIC_API_KEY=${CLAUDE_SESSION_TOKEN}" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "認証方式: CLAUDE_CODE_OAUTH_TOKEN (OAuth トークン)"
+              echo "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_SESSION_TOKEN}" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+          # 初回起動時のオンボーディング（対話プロンプト）を抑止するための設定ファイルを用意する。
+          # Claude Code は ~/.claude.json をユーザー設定として読み込む。
+          mkdir -p "$HOME/.claude"
+          cat > "$HOME/.claude.json" <<'JSON'
+          {
+            "hasCompletedOnboarding": true,
+            "hasTrustDialogAccepted": true
+          }
+          JSON
+
+      # 空のディレクトリで claude -p "ping" を実行する。
+      # カレントディレクトリを /tmp/empty_workspace にすることで、
+      # プロジェクトファイルがコンテキストとして読み込まれないようにする。
+      - name: Claude Code に ping を実行させる
+        run: |
+          set -uo pipefail
+
+          # 空のワークスペースを作って移動する
+          mkdir -p /tmp/empty_workspace
+          cd /tmp/empty_workspace
+
+          # 一時的なネットワークエラー等に備えて最大3回までリトライする
+          attempt=1
+          max_attempts=3
+          until [ "$attempt" -gt "$max_attempts" ]; do
+            echo "--- 実行 ${attempt}/${max_attempts} 回目 ---"
+            # -p        : 非対話（print）モードでプロンプトを渡す
+            # --max-turns 1 : ツール実行などでターンが増えないようにし、消費トークンを最小限にする
+            if claude -p "ping" --max-turns 1 --output-format text; then
+              echo "ping に成功しました。"
+              exit 0
+            fi
+            echo "失敗しました。$((attempt * 10)) 秒待って再試行します。"
+            sleep "$((attempt * 10))"
+            attempt=$((attempt + 1))
+          done
+
+          echo "::error::claude -p \"ping\" が ${max_attempts} 回とも失敗しました。トークンの有効期限切れの可能性があります。"
+          exit 1
