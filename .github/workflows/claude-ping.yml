@@ -4,9 +4,11 @@
 name: Claude Code Ping
 
 on:
-  # 5時間ごとに自動実行（cron は UTC 基準。GitHub 側の混雑によっては数分〜数十分遅延することがある）
+  # 日本時間の 8:00, 10:30, 13:00, 15:30, 18:00, 20:30, 23:00 に実行（0:00〜7:00は休止）
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 23,4,9,14 * * *'
+    - cron: '30 1,6,11 * * *'
+
   # 手動実行（Actions タブの "Run workflow" ボタン）も可能にする
   workflow_dispatch:
 
